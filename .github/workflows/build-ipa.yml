@@ -1,10 +1,6 @@
 name: Build unsigned IPA
 
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -24,7 +20,9 @@ jobs:
         run: brew install xcodegen
 
       - name: Generate Xcode project
-        run: xcodegen generate --spec project.yml
+        run: |
+          mkdir -p Resources
+          xcodegen generate --spec project.yml
 
       - name: Build unsigned .app (iphoneos SDK)
         run: |
@@ -37,7 +35,8 @@ jobs:
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=""
+            CODE_SIGN_IDENTITY="" \
+            SWIFT_STRICT_CONCURRENCY=minimal
 
       - name: Package Payload/ and create IPA
         run: |
@@ -55,9 +54,3 @@ jobs:
           name: ${{ env.APP_NAME }}-ipa
           path: ${{ env.APP_NAME }}.ipa
           retention-days: 14
-
-      - name: Publish GitHub Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: UnityAssetConverter.ipa
