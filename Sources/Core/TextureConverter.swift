@@ -1,18 +1,16 @@
 import Foundation
 
-/// Subset of UnityEngine.TextureFormat. Verify values against your Unity version
-/// before relying on them.
+/// Subset of UnityEngine.TextureFormat.
 enum UnityTextureFormat: Int32 {
     case alpha8 = 1, rgb24 = 3, rgba32 = 4, bgra32 = 14
     case dxt1 = 10, dxt5 = 12
     case pvrtcRGB4 = 32, pvrtcRGBA4 = 33
     case etcRGB4 = 34
     case etc2RGB = 45, etc2RGBA1 = 46, etc2RGBA8 = 47
-    case astc4x4 = 48, astc6x6 = 50
+    case astcRGB4x4 = 48, astcRGB6x6 = 50, astcRGBA4x4 = 54, astcRGBA6x6 = 56
 }
 
-/// Top mip level only. If a texture has a mip chain, strip it or regenerate it,
-/// and update m_MipCount to match.
+/// Top mip level only.
 struct RawTexture {
     var width: Int
     var height: Int
@@ -41,7 +39,8 @@ enum TextureConverter {
 
     static func plan(for format: UnityTextureFormat) -> ConversionPlan {
         switch format {
-        case .etcRGB4, .etc2RGB, .etc2RGBA1, .etc2RGBA8, .astc4x4, .astc6x6:
+        case .etcRGB4, .etc2RGB, .etc2RGBA1, .etc2RGBA8,
+             .astcRGB4x4, .astcRGB6x6, .astcRGBA4x4, .astcRGBA6x6:
             return .passthrough
         case .rgba32, .bgra32, .rgb24, .alpha8, .dxt1, .dxt5:
             return .decodeToRGBA32
@@ -51,8 +50,6 @@ enum TextureConverter {
     }
 
     /// Returns a texture that Metal on iOS can sample.
-    /// For passthrough, the input is returned unchanged.
-    /// The caller must update the Texture2D header (format enum, data size, mip count).
     static func convertForIOS(_ tex: RawTexture) throws -> RawTexture {
         switch plan(for: tex.format) {
         case .passthrough:
@@ -81,7 +78,11 @@ enum TextureConverter {
 
     private static func swizzleBGRA(_ s: [UInt8]) -> [UInt8] {
         var o = s
-        for i in stride(from: 0, to: o.count - 3, by: 4) { o.swapAt(i, i + 2) }
+        var i = 0
+        while i + 3 < o.count {
+            o.swapAt(i, i + 2)
+            i += 4
+        }
         return o
     }
 
@@ -105,12 +106,12 @@ enum TextureConverter {
 
     typealias RGBA = (r: UInt8, g: UInt8, b: UInt8, a: UInt8)
 
-    /// Decodes a DXT1 (dxt5 = false) or DXT5 (dxt5 = true) stream to RGBA32.
     static func decodeBC(_ src: [UInt8], w: Int, h: Int, dxt5: Bool) throws -> [UInt8] {
         let bw = (w + 3) / 4, bh = (h + 3) / 4
         let blockSize = dxt5 ? 16 : 8
         guard src.count >= bw * bh * blockSize else {
-            throw TextureConvertError.badData("DXT data too short: need \(bw * bh * blockSize), have \(src.count)")
+            throw TextureConvertError.badData(
+                "DXT data too short: need \(bw * bh * blockSize), have \(src.count)")
         }
 
         var out = [UInt8](repeating: 0, count: w * h * 4)
@@ -136,10 +137,9 @@ enum TextureConverter {
         return out
     }
 
-    /// 8-byte color block: two RGB565 endpoints plus 16 two-bit indices.
     private static func colorBlock(_ s: [UInt8], _ o: Int, allowTransparent: Bool) -> [RGBA] {
-        let c0 = UInt16(s[o]) | UInt16(s[o + 1]) << 8
-        let c1 = UInt16(s[o + 2]) | UInt16(s[o + 3]) << 8
+        let c0 = UInt16(s[o]) | (UInt16(s[o + 1]) << 8)
+        let c1 = UInt16(s[o + 2]) | (UInt16(s[o + 3]) << 8)
         let p0 = rgb565(c0), p1 = rgb565(c1)
 
         var pal: [RGBA] = [p0, p1, (0, 0, 0, 255), (0, 0, 0, 255)]
@@ -151,12 +151,15 @@ enum TextureConverter {
             pal[3] = (0, 0, 0, 0)        // DXT1 1-bit transparency
         }
 
-        let bits = UInt32(s[o + 4]) | UInt32(s[o + 5]) << 8
-                 | UInt32(s[o + 6]) << 16 | UInt32(s[o + 7]) << 24
-        return (0..<16).map { pal[Int((bits >> (2 * UInt32($0))) & 3)] }
+        let b4 = UInt32(s[o + 4]), b5 = UInt32(s[o + 5])
+        let b6 = UInt32(s[o + 6]), b7 = UInt32(s[o + 7])
+        let bits: UInt32 = b4 | (b5 << 8) | (b6 << 16) | (b7 << 24)
+        return (0..<16).map { (i: Int) -> RGBA in
+            let idx = Int((bits >> UInt32(2 * i)) & 3)
+            return pal[idx]
+        }
     }
 
-    /// 8-byte DXT5 alpha block: two alpha endpoints plus 16 three-bit indices (48 bits).
     private static func alphaBlock(_ s: [UInt8], _ o: Int) -> [UInt8] {
         let a0 = Int(s[o]), a1 = Int(s[o + 1])
         var pal = [a0, a1]
@@ -164,19 +167,22 @@ enum TextureConverter {
             for i in 1...6 { pal.append(((7 - i) * a0 + i * a1) / 7) }
         } else {
             for i in 1...4 { pal.append(((5 - i) * a0 + i * a1) / 5) }
-            pal += [0, 255]
+            pal.append(0)
+            pal.append(255)
         }
 
         var bits: UInt64 = 0
-        for k in 0..<6 { bits |= UInt64(s[o + 2 + k]) << (8 * UInt64(k)) }
-        return (0..<16).map { UInt8(pal[Int((bits >> (3 * UInt64($0))) & 7)]) }
+        for k in 0..<6 { bits |= UInt64(s[o + 2 + k]) << UInt64(8 * k) }
+        return (0..<16).map { (i: Int) -> UInt8 in
+            let idx = Int((bits >> UInt64(3 * i)) & 7)
+            return UInt8(pal[idx])
+        }
     }
 
     private static func rgb565(_ c: UInt16) -> RGBA {
         let r = UInt8((c >> 11) & 0x1F)
         let g = UInt8((c >> 5) & 0x3F)
         let b = UInt8(c & 0x1F)
-        // Bit replication expands 5/6-bit values to 8 bits accurately.
         return ((r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2), 255)
     }
 
